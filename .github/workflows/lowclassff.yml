@@ -1,0 +1,104 @@
+# This workflow creates a persistent VPS using GitHub Actions.
+# The cron schedule ensures the job automatically restarts every 6 hours
+# to maintain continuous uptime and a public IPv4 tunnel.
+name: Continuous Persistent VPS
+ 
+on:
+  schedule:
+    # This cron schedule is the core of the automatic restart system.
+    # It triggers the workflow every 6 hours, just before the timeout is reached.
+    - cron: '0 */6 * * *' 
+  workflow_dispatch:
+ 
+jobs:
+  vps-session:
+    runs-on: ubuntu-latest
+    # The job timeout is set to 350 minutes (just under 6 hours), so the next
+    # cron job can start a new session before this one is terminated.
+    timeout-minutes: 350 
+ 
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+ 
+      - name: Set hostname
+        run: sudo hostnamectl set-hostname lowclass
+ 
+      - name: Download VPS backup (if any)
+        uses: actions/download-artifact@v4
+        with:
+          name: vps-backup
+          path: ./backup
+        # The job will continue even if no backup is found on the first run.
+        continue-on-error: true
+ 
+      - name: Install prerequisites and ngrok
+        run: |
+          sudo apt update
+          sudo apt install -y curl unzip sudo net-tools neofetch jq
+          # Download and install the ngrok tunneling tool.
+          curl -s https://bin.equinox.io/c/4VmDzA7iaHb/ngrok-stable-linux-amd64.zip -o ngrok.zip
+          unzip -o ngrok.zip
+          sudo mv ngrok /usr/local/bin/ngrok
+ 
+      - name: Restore backup files
+        run: |
+          if [ -f ./backup/backup.zip ]; then
+            unzip -o ./backup/backup.zip -d /
+            echo "Backup restored successfully."
+          else
+            echo "No backup found, starting fresh."
+          fi
+ 
+      - name: Create user lowclass with sudo
+        run: |
+          # This step creates the user with a default password and grants sudo privileges.
+          if ! id -u lowclass >/dev/null 2>&1; then
+            sudo useradd -m -s /bin/bash lowclass
+            echo "lowclass:lowclass" | sudo chpasswd
+            sudo usermod -aG sudo lowclass
+            echo "lowclass ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/lowclass
+          fi
+ 
+      - name: Authenticate ngrok and start public IPv4 tunnel
+        env:
+          # This pulls the ngrok token from your repository secrets.
+          NGROK_AUTH_TOKEN: ${{ secrets.NGROK_AUTH_TOKEN }}
+        run: |
+          # Use the ngrok token to authenticate the account.
+          ngrok config add-authtoken "$NGROK_AUTH_TOKEN"
+          # Start a TCP tunnel to the SSH port (22) in the background.
+          ngrok tcp 22 &
+          echo "Public IPv4 tunnel started with ngrok."
+ 
+      - name: Show connection info
+        run: |
+          echo "🌐 ngrok Public IPv4 tunnel:"
+          # Use ngrok's API to find the dynamic public IP address and port.
+          # The `jq` command is used to parse the JSON response.
+          ngrok_url=$(curl -s http://127.0.0.1:4040/api/tunnels | jq -r '.tunnels[0].public_url')
+          echo "The ngrok tunnel is available at: $ngrok_url"
+          echo ""
+          echo "To connect, use this command:"
+          echo "ssh -p <port> lowclass@<host>"
+          echo "Example: ssh -p 12345 lowclass@0.tcp.ngrok.io"
+ 
+      - name: Wait for job to time out
+        run: |
+          echo "The job is now running. It will be kept alive until the timeout is reached."
+          # This simple loop keeps the job from exiting immediately, allowing the
+          # sessions to remain open for the full timeout duration.
+          while true; do sleep 60; done
+ 
+      - name: Backup VPS data
+        # This step runs as the job is about to time out, ensuring data is saved.
+        run: |
+          sudo mkdir -p /opt/vps-backup
+          sudo chown -R $USER:$USER /opt/vps-backup
+          zip -r backup.zip /opt/vps-backup
+ 
+      - name: Upload VPS backup artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vps-backup
+          path: backup.zip
